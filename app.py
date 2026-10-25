@@ -1,277 +1,858 @@
-import os, json, random, math, io, uuid
-from collections import deque
-from pathlib import Path
-import numpy as np
+# -*- coding: utf-8 -*-
+"""
+Генератор математических лабиринтов: обыкновенные и десятичные дроби, 5–8 класс.
+ИИ не используется: примеры берутся из tasks_bank.py, ответы считает программа.
+
+Запуск сайта:            python app.py              -> http://127.0.0.1:5000
+Проверка банка задач:    python app.py check
+Пробный PDF без сайта:   python app.py demo 5 fraction
+"""
+import io
+import math
+import os
+import random
+import re
+import sys
+from dataclasses import dataclass
+from fractions import Fraction
+from functools import lru_cache
+
 import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from flask import Flask, request, send_file, redirect, url_for, flash, render_template_string
+matplotlib.use("Agg")
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
+
+from flask import Flask, flash, redirect, render_template_string, request, send_file, url_for
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
-from reportlab.pdfgen import canvas as pdf_canvas
 from reportlab.lib.utils import ImageReader
-from openai import OpenAI
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen import canvas as pdf_canvas
 
-# ============ ИИ ============
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")  # на хостинге ключ хранится в переменных окружения
-client = None; AI_AVAILABLE = False
-if GROQ_API_KEY:
-    try:
-        client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
-        AI_AVAILABLE = True
-    except: pass
+from tasks_bank import TASK_BANK
 
-# ============ ЗАДАЧИ ============
-def generate_tasks_ai(topic, grade=7, count=16):
-    prompt = f"""Ты — учитель математики. Создай ровно {count} задач. ТЕМА: {topic}, КЛАСС: {grade}.
-Требования: разной сложности, один короткий числовой ответ (1-5 символов), текст до 2 строк, 3 неправильных ответа — типичные ошибки.
-Верни СТРОГО JSON без markdown: {{"tasks": [{{"task_text":"...","draw_type":"text","draw_params":{{}},"correct_answer":"6.2","wrong_answers":["5.12","6.8","7.2"]}}]}}"""
-    try:
-        resp = client.chat.completions.create(model="llama-3.1-8b-instant",
-            messages=[{"role":"system","content":"Отвечай ТОЛЬКО JSON."},{"role":"user","content":prompt}],
-            temperature=0.8, max_tokens=4000)
-        raw = resp.choices[0].message.content.strip()
-        if raw.startswith("```"): raw = "\n".join(raw.split("\n")[1:-1])
-        data = json.loads(raw)
-        tasks = data.get("tasks", data) if isinstance(data, dict) else data
-        return [{"task_text":str(t.get("task_text","?")),"draw_type":t.get("draw_type","text"),
-                 "draw_params":t.get("draw_params",{}),"correct_answer":str(t.get("correct_answer","?")),
-                 "wrong_answers":[str(w) for w in t.get("wrong_answers",["?","??","???"])][:3]} for t in tasks[:count]]
-    except Exception as e:
-        print(f"ИИ ошибка: {e}")
-        return generate_tasks_fallback(topic, count)
+# ======================================================================
+# НАСТРОЙКИ
+# ======================================================================
+GRADES = [5, 6, 7, 8]
+TOPICS = {"decimal": "десятичные дроби", "fraction": "обыкновенные дроби"}
+MAX_LABEL_LEN = 9        # максимальная длина ответа на коридоре (символов)
+MAX_DENOMINATOR = 200    # слишком громоздкие дроби в коридор не пускаем
+RENDER_DPI = 300         # качество формул в PDF
 
-def generate_tasks_fallback(topic, count=16):
-    tasks = []; tl = topic.lower()
-    for _ in range(count):
-        if "дроб" in tl:
-            a=round(random.uniform(0.1,9.9),1); b=round(random.uniform(0.1,9.9),1); op=random.choice(["+","-","×"])
-            if op=="+": ans=round(a+b,2); txt=f"{a} + {b} = ?"
-            elif op=="-": a,b=max(a,b),min(a,b); ans=round(a-b,2); txt=f"{a} - {b} = ?"
-            else: a=round(random.uniform(0.1,3),1); b=round(random.uniform(0.1,3),1); ans=round(a*b,2); txt=f"{a} × {b} = ?"
-            tasks.append(_mk("text",txt,ans,_wrong(ans,True)))
-        elif "уравнен" in tl:
-            x=random.randint(1,20); a=random.randint(2,10); b=random.randint(1,50); c=a*x+b
-            tasks.append(_mk("equation",f"{a}x+{b}={c}\nНайди x",x,_wrong(x),{"equation":f"{a}x + {b} = {c}"}))
-        elif "угл" in tl or "градус" in tl:
-            known=random.randint(20,160); ans=180-known
-            tasks.append(_mk("text",f"Смежные углы:\n∠1={known}°, ∠2=?",f"{ans}°",[f"{w}°" for w in _wrong(ans)]))
+# Шрифт формул. "cm" — как в учебнике, "dejavusans" — крупнее и чётче при печати
+matplotlib.rcParams["mathtext.fontset"] = "dejavusans"
+
+# Шрифт с кириллицей для PDF (уже лежит внутри matplotlib, скачивать не нужно)
+_FONT_DIR = os.path.join(matplotlib.get_data_path(), "fonts", "ttf")
+pdfmetrics.registerFont(TTFont("DejaVu", os.path.join(_FONT_DIR, "DejaVuSans.ttf")))
+pdfmetrics.registerFont(TTFont("DejaVu-Bold", os.path.join(_FONT_DIR, "DejaVuSans-Bold.ttf")))
+
+
+# ======================================================================
+# 1. РАЗБОР ВЫРАЖЕНИЯ: "2 1/3 * (0,5 - 1/4)" -> дерево -> ответ и формула
+# ======================================================================
+TOKEN_RE = re.compile(r"""
+    (?P<mixed>\d+[ ]\d+/\d+)      # смешанное число: 2 1/3
+  | (?P<frac>\d+/\d+)             # дробь: 3/4 (без пробелов вокруг /)
+  | (?P<dec>\d+,\d+)              # десятичная дробь: 1,25
+  | (?P<int>\d+)                  # целое число
+  | (?P<sqrt>sqrt|√)              # корень
+  | (?P<op>[-+*·×:/^()−])         # знаки и скобки
+  | (?P<ws>\s+)
+""", re.VERBOSE)
+
+
+def tokenize(s):
+    pos, out = 0, []
+    while pos < len(s):
+        m = TOKEN_RE.match(s, pos)
+        if not m:
+            raise ValueError(f"непонятный символ «{s[pos]}»")
+        pos = m.end()
+        kind, val = m.lastgroup, m.group()
+        if kind == "ws":
+            continue
+        if kind == "op":
+            val = {"·": "*", "×": "*", "−": "-"}.get(val, val)
+        out.append((kind, val))
+    return out
+
+
+def make_num(kind, val):
+    """Узел-число: ('num', значение, формула, вид).
+    Неправильные дроби разрешены: 7/4, 40/1, 6 7/4 и т.п.
+    Запрещён только знаменатель 0."""
+    if kind == "int":
+        return ("num", Fraction(int(val)), val, kind)
+    if kind == "dec":
+        a, b = val.split(",")
+        return ("num", Fraction(int(a + b), 10 ** len(b)), val.replace(",", "{,}"), kind)
+    if kind == "frac":
+        n, d = map(int, val.split("/"))
+        if d == 0:
+            raise ValueError(f"знаменатель равен нулю: {val}")
+        return ("num", Fraction(n, d), rf"\frac{{{n}}}{{{d}}}", kind)
+    # смешанное число: дробная часть может быть неправильной (6 7/4 = 7 3/4)
+    w, fr = val.split(" ")
+    n, d = map(int, fr.split("/"))
+    if d == 0:
+        raise ValueError(f"знаменатель равен нулю: {val}")
+    return ("num", int(w) + Fraction(n, d), rf"{w}\frac{{{n}}}{{{d}}}", kind)
+
+
+class Parser:
+    """Порядок действий: скобки -> степень -> минус перед числом -> · : -> + −"""
+
+    def __init__(self, tokens):
+        self.t, self.i = tokens, 0
+
+    def peek(self):
+        return self.t[self.i] if self.i < len(self.t) else (None, None)
+
+    def take(self, val=None):
+        tok = self.peek()
+        if tok[0] is None or (val is not None and tok[1] != val):
+            raise ValueError(f"ожидалось «{val}»")
+        self.i += 1
+        return tok
+
+    def parse(self):
+        node = self.expr()
+        if self.i != len(self.t):
+            raise ValueError("лишние символы в конце")
+        return node
+
+    def expr(self):
+        node = self.term()
+        while self.peek()[0] == "op" and self.peek()[1] in "+-":
+            op = self.take()[1]
+            node = ("bin", op, node, self.term())
+        return node
+
+    def term(self):
+        node = self.unary()
+        while self.peek()[0] == "op" and self.peek()[1] in "*:/":
+            op = self.take()[1]
+            node = ("bin", op, node, self.unary())
+        return node
+
+    def unary(self):
+        if self.peek() == ("op", "-"):
+            self.take()
+            return ("neg", self.unary())
+        if self.peek() == ("op", "+"):
+            self.take()
+            return self.unary()
+        return self.power()
+
+    def power(self):
+        base = self.atom()
+        if self.peek() == ("op", "^"):
+            self.take()
+            return ("pow", base, self.unary())
+        return base
+
+    def atom(self):
+        kind, val = self.peek()
+        if kind in ("int", "dec", "frac", "mixed"):
+            self.take()
+            return make_num(kind, val)
+        if kind == "sqrt":
+            self.take(); self.take("(")
+            inner = self.expr()
+            self.take(")")
+            return ("sqrt", inner)
+        if (kind, val) == ("op", "("):
+            self.take()
+            inner = self.expr()
+            self.take(")")
+            return ("par", inner)
+        raise ValueError("ожидалось число или скобка")
+
+
+def evaluate(node):
+    """Точное вычисление в обыкновенных дробях (без ошибок округления)."""
+    t = node[0]
+    if t == "num":
+        return node[1]
+    if t == "par":
+        return evaluate(node[1])
+    if t == "neg":
+        return -evaluate(node[1])
+    if t == "sqrt":
+        v = evaluate(node[1])
+        if v < 0:
+            raise ValueError("корень из отрицательного числа")
+        rn, rd = math.isqrt(v.numerator), math.isqrt(v.denominator)
+        if rn * rn != v.numerator or rd * rd != v.denominator:
+            raise ValueError("корень не извлекается нацело")
+        return Fraction(rn, rd)
+    if t == "pow":
+        b, e = evaluate(node[1]), evaluate(node[2])
+        if e.denominator != 1 or abs(e) > 20:
+            raise ValueError("показатель степени должен быть небольшим целым")
+        if b == 0 and e < 0:
+            raise ValueError("ноль в отрицательной степени")
+        return b ** int(e)
+    op, a, b = node[1], evaluate(node[2]), evaluate(node[3])
+    if op == "+":
+        return a + b
+    if op == "-":
+        return a - b
+    if op == "*":
+        return a * b
+    if b == 0:
+        raise ValueError("деление на ноль")
+    return a / b
+
+
+def strip_par(node):
+    while node[0] == "par":
+        node = node[1]
+    return node
+
+
+def to_tex(node):
+    """Формула для отрисовки: · вместо *, дробная черта, степени, √."""
+    t = node[0]
+    if t == "num":
+        return node[2]
+    if t == "par":
+        return r"\left(" + to_tex(node[1]) + r"\right)"
+    if t == "neg":
+        return "-" + to_tex(node[1])
+    if t == "sqrt":
+        return r"\sqrt{" + to_tex(node[1]) + "}"
+    if t == "pow":
+        base = to_tex(node[1])
+        if node[1][0] == "num" and node[1][3] in ("frac", "mixed"):
+            base = r"\left(" + base + r"\right)"
+        return base + "^{" + to_tex(strip_par(node[2])) + "}"
+    op = node[1]
+    if op == "/":
+        return r"\frac{" + to_tex(strip_par(node[2])) + "}{" + to_tex(strip_par(node[3])) + "}"
+    sym = {"+": "+", "-": "-", "*": r"\cdot", ":": ":"}[op]
+    return f"{to_tex(node[2])} {sym} {to_tex(node[3])}"
+
+
+def complexity(node):
+    """Грубая оценка сложности: больше действий и цифр — сложнее."""
+    t = node[0]
+    if t == "num":
+        return 1 + 0.15 * sum(ch.isdigit() for ch in node[2])
+    if t == "par":
+        return complexity(node[1])
+    if t in ("neg", "sqrt"):
+        return 0.5 + complexity(node[1])
+    if t == "pow":
+        return 1 + complexity(node[1]) + complexity(node[2])
+    return 1.5 + complexity(node[2]) + complexity(node[3])
+
+
+def parse_task(expr):
+    node = Parser(tokenize(expr)).parse()
+    return node, evaluate(node)
+
+
+# ======================================================================
+# 2. ЗАПИСЬ ОТВЕТОВ: 0,25 / 2 1/3 / -5/6
+# ======================================================================
+def decimal_places(v):
+    """Сколько знаков после запятой; None — если дробь бесконечная."""
+    d, twos, fives = v.denominator, 0, 0
+    while d % 2 == 0:
+        d //= 2; twos += 1
+    while d % 5 == 0:
+        d //= 5; fives += 1
+    return max(twos, fives) if d == 1 else None
+
+
+def fmt_decimal(v):
+    k = decimal_places(v)
+    sign = "-" if v < 0 else ""
+    v = abs(v)
+    s = str(v.numerator * 10 ** k // v.denominator).rjust(k + 1, "0")
+    return sign + (s[:-k] + "," + s[-k:] if k else s)
+
+
+def fmt_fraction(v):
+    if v.denominator == 1:
+        return str(v.numerator)
+    sign = "-" if v < 0 else ""
+    v = abs(v)
+    w, r = divmod(v.numerator, v.denominator)
+    return sign + (f"{w} {r}/{v.denominator}" if w else f"{r}/{v.denominator}")
+
+
+def format_answer(v, topic):
+    return fmt_decimal(v) if topic == "decimal" else fmt_fraction(v)
+
+
+def show_value(v, topic):
+    if topic == "decimal" and decimal_places(v) is not None:
+        return fmt_decimal(v)
+    return fmt_fraction(v)
+
+
+def fmt_tex(plain):
+    """'2 1/3' -> 2\\frac{1}{3},  '0,25' -> 0{,}25"""
+    m = re.fullmatch(r"(-?)(?:(\d+) )?(\d+)/(\d+)", plain)
+    if m:
+        sign, w, n, d = m.groups()
+        return f"{sign}{w or ''}\\frac{{{n}}}{{{d}}}"
+    return plain.replace(",", "{,}")
+
+
+def answer_ok(v, topic):
+    """Подходит ли ответ для подписи коридора."""
+    if topic == "decimal":
+        return decimal_places(v) is not None and len(fmt_decimal(v)) <= MAX_LABEL_LEN
+    return v.denominator <= MAX_DENOMINATOR and len(fmt_fraction(v)) <= MAX_LABEL_LEN
+
+
+# ======================================================================
+# 3. БАНК ЗАДАЧ
+# ======================================================================
+@dataclass
+class BankTask:
+    text: str           # исходная запись
+    tex: str            # формула для печати
+    value: Fraction     # точный ответ
+    answer: str         # ответ в виде строки
+    difficulty: float
+
+
+def _split_item(item):
+    if isinstance(item, (tuple, list)):
+        return str(item[0]).strip(), (str(item[1]).strip() if len(item) > 1 else None)
+    return str(item).strip(), None
+
+
+@lru_cache(maxsize=None)
+def get_pool(grade, topic):
+    pool, seen = [], set()
+    for item in TASK_BANK.get(f"{grade}_{topic}", []):
+        expr, _ = _split_item(item)
+        if expr in seen:
+            continue
+        seen.add(expr)
+        try:
+            node, val = parse_task(expr)
+        except (ValueError, ZeroDivisionError):
+            continue
+        if not answer_ok(val, topic):
+            continue
+        pool.append(BankTask(expr, to_tex(node), val, format_answer(val, topic), complexity(node)))
+    return tuple(pool)
+
+
+# ======================================================================
+# 4. ЛОВУШКИ — правдоподобные неправильные ответы (типичные ошибки)
+# ======================================================================
+def make_distractors(value, topic, allow_negative, k=6):
+    used, out = {format_answer(value, topic)}, []
+
+    def try_add(cand):
+        if len(out) >= k or (cand < 0 and not allow_negative) or not answer_ok(cand, topic):
+            return
+        s = format_answer(cand, topic)
+        if s not in used:
+            used.add(s)
+            out.append(s)
+
+    typical, other = [], []
+    if topic == "decimal":
+        step = Fraction(1, 10 ** (decimal_places(value) or 0))
+        typical += [value * 10, value / 10]                       # запятая не там
+        other += [value + step, value - step, value + 1, value - 1,
+                  value + Fraction(1, 10), value - Fraction(1, 10), value * 100, value / 100]
+    else:
+        d = value.denominator
+        if value != 0:
+            typical.append(1 / value)                             # перевернули дробь
+        if d > 1:
+            typical += [value + Fraction(1, d), value - Fraction(1, d)]
+            other += [value + 1, value - 1, value * 2, value / 2,
+                      Fraction(value.numerator, d + 1), Fraction(value.numerator + 1, d + 1)]
         else:
-            a=random.randint(2,50); b=random.randint(2,50); op=random.choice(["+","-","×"])
-            if op=="+": ans=a+b; txt=f"{a} + {b} = ?"
-            elif op=="-": a,b=max(a,b),min(a,b); ans=a-b; txt=f"{a} - {b} = ?"
-            else: a=random.randint(2,12); b=random.randint(2,12); ans=a*b; txt=f"{a} × {b} = ?"
-            tasks.append(_mk("text",txt,ans,_wrong(ans)))
-    return tasks
+            typical += [value + 1, value - 1]
+            other += [value * 2, value + Fraction(1, 2), value - Fraction(1, 2), value + 2]
+    if allow_negative and value != 0:
+        typical.append(-value)                                    # ошибка в знаке
+    random.shuffle(typical)
+    random.shuffle(other)
+    for cand in typical + other:
+        try_add(cand)
 
-def _mk(dt,txt,ans,wr,dp=None):
-    return {"task_text":txt,"draw_type":dt,"draw_params":dp or {},"correct_answer":str(ans),"wrong_answers":[str(w) for w in wr[:3]]}
-def _wrong(c, dec=False):
-    s=set()
-    for _ in range(50):
-        if len(s)>=3: break
-        if dec: w=round(c+random.choice([-1,-0.1,0.1,0.5,1])*random.randint(1,3),2)
-        else: w=int(c)+random.choice([-5,-3,-1,1,2,3,5])
-        if w!=c and w>0: s.add(w)
-    while len(s)<3: s.add(int(c)+len(s)+1)
-    return list(s)[:3]
+    if topic == "decimal":
+        step = Fraction(1, 10 ** (decimal_places(value) or 0))
+    else:
+        step = Fraction(1, value.denominator if value.denominator > 1 else random.choice([2, 3, 4]))
+    for _ in range(300):
+        if len(out) >= k:
+            break
+        try_add(value + random.choice([-1, 1]) * step * random.randint(2, 12))
+    return out
 
-# ============ ЛАБИРИНТ ============
+
+# ======================================================================
+# 5. ЛАБИРИНТ
+# ======================================================================
 class MathMaze:
-    def __init__(self, cols=3, rows=6):
-        self.cols=cols; self.rows=rows; self.total_cells=cols*rows
-        self.neighbors={}
+    """Сетка клеток. Все соседние клетки соединены коридорами.
+    Правильный путь не касается сам себя, поэтому неправильный коридор
+    всегда ведёт в тупик, а не «срезает» дорогу к финишу."""
+
+    def __init__(self, cols, rows, topic, grade):
+        self.cols, self.rows, self.topic, self.grade = cols, rows, topic, grade
+        self.n = cols * rows
+        self.nb = {i: [] for i in range(self.n)}
         for r in range(rows):
             for c in range(cols):
-                idx=r*cols+c; nb=[]
-                if c>0: nb.append(idx-1)
-                if c<cols-1: nb.append(idx+1)
-                if r>0: nb.append(idx-cols)
-                if r<rows-1: nb.append(idx+cols)
-                self.neighbors[idx]=nb
-        self.correct_path=[]; self.corridors={}; self.cell_tasks={}
-    def generate_path(self, start=0, end=None):
-        if end is None: end=self.total_cells-1
-        best=None
-        for _ in range(30):
-            path=[]; vis=set()
-            def dfs(n):
-                if n==end: path.append(n); return True
-                vis.add(n); path.append(n); nb=self.neighbors[n][:]; random.shuffle(nb)
-                for x in nb:
-                    if x not in vis and dfs(x): return True
-                path.pop(); vis.discard(n); return False
-            if dfs(start) and (best is None or len(path)>len(best)): best=path[:]
-        if best and len(best)>=4: self.correct_path=best
-        else:
-            from collections import deque as dq
-            q=dq([(start,[start])]); vi={start}
-            while q:
-                n,p=q.popleft()
-                if n==end: self.correct_path=p; break
-                for x in self.neighbors[n]:
-                    if x not in vi: vi.add(x); q.append((x,p+[x]))
-        return self.correct_path
-    def assign_tasks(self, tasks):
-        path=self.correct_path; fin=path[-1]; idx=0
-        for c in path[:-1]:
-            if idx<len(tasks): self.cell_tasks[c]=tasks[idx]; idx+=1
-        for c in range(self.total_cells):
-            if c not in self.cell_tasks and c!=fin:
-                self.cell_tasks[c]=tasks[idx] if idx<len(tasks) else random.choice(tasks)
-                if idx<len(tasks): idx+=1
-        self.corridors={}; edges=set()
-        for i in range(len(path)-1):
-            a,b=path[i],path[i+1]; e=(min(a,b),max(a,b)); edges.add(e)
-            if a in self.cell_tasks: self.corridors[e]={"label":self.cell_tasks[a]["correct_answer"],"is_correct":True}
-        for c in path[:-1]:
-            wr=self.cell_tasks.get(c,{}).get("wrong_answers",[]); k=0
-            for nb in self.neighbors[c]:
-                e=(min(c,nb),max(c,nb))
-                if e not in self.corridors and k<len(wr): self.corridors[e]={"label":wr[k],"is_correct":False}; k+=1
+                i = r * cols + c
+                if c + 1 < cols:
+                    self._link(i, i + 1)
+                if r + 1 < rows:
+                    self._link(i, i + cols)
+        self.edges = sorted((a, b) for a in range(self.n) for b in self.nb[a] if a < b)
+        self.path, self.task, self.traps, self.label = [], {}, {}, {}
+
+    def _link(self, a, b):
+        self.nb[a].append(b)
+        self.nb[b].append(a)
+
+    @property
+    def start(self):
+        return self.path[0]
+
+    @property
+    def finish(self):
+        return self.path[-1]
+
+    def path_edges(self):
+        return {tuple(sorted(e)) for e in zip(self.path, self.path[1:])}
+
+    # ---------- правильный путь ----------
+    def _random_path(self, target, budget=4000):
+        last_row = range((self.rows - 1) * self.cols, self.n)
+        path, inside, steps = [0], {0}, [0]
+
+        def can_go(nxt, tail):
+            return nxt not in inside and all(x == tail or x not in inside for x in self.nb[nxt])
+
+        def dfs():
+            steps[0] += 1
+            if steps[0] > budget:
+                return False
+            tail = path[-1]
+            if tail in last_row and len(path) >= target:
+                return True
+            options = self.nb[tail][:]
+            random.shuffle(options)
+            for nxt in options:
+                if can_go(nxt, tail):
+                    path.append(nxt); inside.add(nxt)
+                    if dfs():
+                        return True
+                    path.pop(); inside.discard(nxt)
+            return False
+
+        return path if dfs() else None
+
+    def generate_path(self):
+        target = int(self.n * 0.65)
+        while target >= self.rows:
+            for _ in range(12):
+                p = self._random_path(target)
+                if p:
+                    self.path = p
+                    return p
+            target -= 1
+        self.path = [r * self.cols for r in range(self.rows)]   # запасной: прямо вниз
+        return self.path
+
+    # ---------- задачи и подписи коридоров ----------
+    def fill(self, pool):
+        need = len(self.path) - 1                       # финиш без задачи
+        shuffled = random.sample(pool, len(pool))
+        path_tasks, answers = [], set()
+        for t in shuffled:                              # на пути все ответы разные
+            if t.answer not in answers:
+                path_tasks.append(t)
+                answers.add(t.answer)
+            if len(path_tasks) == need:
+                break
+        if len(path_tasks) < need:
+            raise ValueError("В банке слишком мало задач с разными ответами. Уменьшите размер лабиринта.")
+        path_tasks.sort(key=lambda t: t.difficulty)     # от простого к сложному
+
+        for cell, t in zip(self.path[:-1], path_tasks):
+            self.task[cell] = t
+        used = {t.text for t in path_tasks}
+        rest = [t for t in shuffled if t.text not in used] or list(pool)
+        dead = [c for c in range(self.n) if c not in self.path]
+        for j, cell in enumerate(dead):
+            self.task[cell] = rest[j % len(rest)]
+
+        for cell, t in self.task.items():
+            allow_neg = self.grade >= 7 or t.value < 0
+            self.traps[cell] = make_distractors(t.value, self.topic, allow_neg)
+
+        self._path_set = set(self.path)
+        self.label = {}
+        for a, b in zip(self.path, self.path[1:]):
+            self.label[tuple(sorted((a, b)))] = self.task[a].answer
+        others = [e for e in self.edges if e not in self.label]
+        random.shuffle(others)
+        others.sort(key=lambda e: -((e[0] in self._path_set) + (e[1] in self._path_set)))
+        for e in others:
+            self.label[e] = self._pick_trap(e)
         return self
 
-# ============ РИСОВАНИЕ ============
-def draw_task_image(task):
-    fig,ax=plt.subplots(figsize=(2.8,1.8),dpi=150); ax.axis('off')
-    t=task.get("draw_type","text"); p=task.get("draw_params",{}); txt=task.get("task_text","")
-    if t=="text": ax.text(0.5,0.5,txt,ha='center',va='center',fontsize=11,fontweight='bold',wrap=True,transform=ax.transAxes)
-    elif t=="equation":
-        eq=p.get("equation",txt); ax.text(0.5,0.82,"Найди x:",ha='center',va='center',fontsize=8,style='italic',transform=ax.transAxes)
-        ax.text(0.5,0.4,eq,ha='center',va='center',fontsize=14,fontweight='bold',fontfamily='monospace',transform=ax.transAxes)
-    elif t=="angle":
-        rays=p.get("rays",[0,65,147]); labels=p.get("labels",["C","B","A"]); origin=(0.5,0.15); length=0.38
-        ax.set_xlim(0,1); ax.set_ylim(0,1)
-        for i,a in enumerate(rays):
-            rad=math.radians(a); ex=origin[0]+length*math.cos(rad); ey=origin[1]+length*math.sin(rad)
-            ax.annotate("",xy=(ex,ey),xytext=origin,arrowprops=dict(arrowstyle="->",color='black',lw=1.5))
-            if i<len(labels): ax.text(origin[0]+(length+0.07)*math.cos(rad),origin[1]+(length+0.07)*math.sin(rad),labels[i],fontsize=9,ha='center',va='center',fontweight='bold')
-        ax.plot(*origin,'ko',markersize=4); ax.text(0.45,0.08,'O',fontsize=9,fontweight='bold'); ax.text(0.4,0.35,'x=?',fontsize=11,fontweight='bold',color='red')
-    else: ax.text(0.5,0.5,txt,ha='center',va='center',fontsize=10,transform=ax.transAxes)
-    plt.tight_layout(pad=0.3); buf=io.BytesIO()
-    fig.savefig(buf,format='png',bbox_inches='tight',pad_inches=0.05,facecolor='white'); plt.close(fig); buf.seek(0); return buf
+    def _forbidden(self, cell):
+        bad = {lab for e, lab in self.label.items() if cell in e}
+        if cell in self.task:
+            bad.add(self.task[cell].answer)
+        return bad
 
-# ============ PDF ============
-def build_maze_pdf(maze, title, filename):
-    pw,ph=A4; c=pdf_canvas.Canvas(filename,pagesize=A4)
-    ml=10*mm; mt=25*mm; gx=10*mm; gy=9*mm; cols=maze.cols; rows=maze.rows
-    cw=min((pw-2*ml-(cols-1)*gx)/cols,58*mm); ch=min((ph-mt-15*mm-(rows-1)*gy)/rows,35*mm)
-    sh=2*mm; rad=3*mm
-    c.setFont("Helvetica-Bold",18); c.drawCentredString(pw/2,ph-18*mm,title.upper())
-    pos={}; tw=cols*cw+(cols-1)*gx; sx=(pw-tw)/2
-    for r in range(rows):
-        for co in range(cols):
-            idx=r*cols+co; pos[idx]=(sx+co*(cw+gx), ph-mt-(r+1)*ch-r*gy)
-    for (a,b),info in maze.corridors.items():
-        if a not in pos or b not in pos: continue
-        xa,ya=pos[a]; xb,yb=pos[b]; lb=info["label"]; ca2,ra2=a%cols,a//cols; cb2,rb2=b%cols,b//cols
-        if ra2==rb2:
-            left=min(xa,xb)+cw; mid=ya+ch/2; h=ch*0.35
-            c.setFillColorRGB(0.95,0.95,0.95); c.setStrokeColorRGB(0.3,0.3,0.3); c.setLineWidth(0.5)
-            c.rect(left,mid-h/2,gx,h,fill=1,stroke=1); c.setFont("Helvetica-Bold",7); c.setFillColorRGB(0,0,0); c.drawCentredString(left+gx/2,mid-2,str(lb))
-        elif ca2==cb2:
-            mx=pos[min(a,b)][0]+cw/2; ty=pos[min(a,b)][1]; w=cw*0.3
-            c.setFillColorRGB(0.95,0.95,0.95); c.setStrokeColorRGB(0.3,0.3,0.3); c.setLineWidth(0.5)
-            c.rect(mx-w/2,ty-gy,w,gy,fill=1,stroke=1); c.setFont("Helvetica-Bold",7); c.setFillColorRGB(0,0,0); c.drawCentredString(mx,ty-gy/2-2,str(lb))
-    for idx in range(maze.total_cells):
-        if idx not in pos: continue
-        x,y=pos[idx]
-        c.setFillColorRGB(0.2,0.2,0.2); c.roundRect(x+sh,y-sh,cw,ch,rad,fill=1,stroke=0)
-        c.setFillColorRGB(1,1,1); c.setStrokeColorRGB(0,0,0); c.setLineWidth(1.5); c.roundRect(x,y,cw,ch,rad,fill=1,stroke=1)
-        if idx==maze.correct_path[0]:
-            c.saveState(); c.setFont("Helvetica-Bold",7); c.setFillColorRGB(0.8,0,0); c.translate(x+4*mm,y+ch/2); c.rotate(90); c.drawCentredString(0,0,"СТАРТ"); c.restoreState()
-            if idx in maze.cell_tasks: img=draw_task_image(maze.cell_tasks[idx]); c.drawImage(ImageReader(img),x+8*mm,y+2*mm,width=cw-10*mm,height=ch-4*mm,preserveAspectRatio=True,mask='auto')
-        elif idx==maze.correct_path[-1]:
-            c.setFont("Helvetica-Bold",18); c.setFillColorRGB(0,0.5,0); c.drawCentredString(x+cw/2,y+ch/2-4,"ФИНИШ")
-        else:
-            if idx in maze.cell_tasks: img=draw_task_image(maze.cell_tasks[idx]); c.drawImage(ImageReader(img),x+2*mm,y+1*mm,width=cw-4*mm,height=ch-2*mm,preserveAspectRatio=True,mask='auto')
-    c.setFont("Helvetica",6); c.setFillColorRGB(0.5,0.5,0.5); c.drawCentredString(pw/2,5*mm,"Реши задачу -> найди ответ на коридоре -> иди дальше -> дойди до ФИНИША")
-    c.showPage()
-    c.setFont("Helvetica-Bold",16); c.setFillColorRGB(0,0,0); c.drawCentredString(pw/2,ph-20*mm,"ОТВЕТЫ (для учителя)")
-    c.setFont("Helvetica",10); yp=ph-40*mm; c.drawString(15*mm,yp,f"Маршрут: {' -> '.join(map(str,maze.correct_path))}"); yp-=12*mm
-    c.setFont("Helvetica",9)
-    for cell in maze.correct_path[:-1]:
-        t=maze.cell_tasks.get(cell,{}); txt=t.get("task_text","-").replace("\n"," "); ans=t.get("correct_answer","-")
-        c.drawString(15*mm,yp,f"Ячейка {cell}: {txt}"); c.setFont("Helvetica-Bold",9); c.drawString(140*mm,yp,f"= {ans}"); c.setFont("Helvetica",9); yp-=8*mm
-        if yp<20*mm: c.showPage(); yp=ph-20*mm
-    c.showPage(); c.save(); return filename
+    def _pick_trap(self, edge):
+        a, b = edge
+        with_task = [x for x in (a, b) if x in self.task]
+        on_path = [x for x in with_task if x in self._path_set]
+        off_path = [x for x in with_task if x not in self._path_set]
+        random.shuffle(off_path)
+        owners = on_path + off_path
+        bad = self._forbidden(a) | self._forbidden(b)
+        for owner in owners:
+            for cand in self.traps[owner]:
+                if cand not in bad:
+                    return cand
+        t = self.task[owners[0]]
+        for cand in make_distractors(t.value, self.topic, True, k=40):
+            if cand not in bad:
+                return cand
+        return "?"
 
-# ============ FLASK САЙТ ============
-site = Flask(__name__)
-site.secret_key = "maze-key"
-os.makedirs("output", exist_ok=True)
+
+def create_maze(topic, grade, cols, rows):
+    pool = get_pool(grade, topic)
+    if len(pool) < 8:
+        raise ValueError(f"В банке «{grade}_{topic}» слишком мало подходящих задач ({len(pool)}).")
+    maze = MathMaze(cols, rows, topic, grade)
+    maze.generate_path()
+    return maze.fill(pool)
+
+
+# ======================================================================
+# 6. ОТРИСОВКА PDF
+# ======================================================================
+@lru_cache(maxsize=4096)
+def render_tex(tex, fontsize):
+    """Формула -> прозрачная PNG-картинка (байты)."""
+    fig = Figure(figsize=(1, 1))
+    FigureCanvasAgg(fig)
+    fig.text(0, 0, f"${tex}$", fontsize=fontsize, color="black")
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=RENDER_DPI, transparent=True,
+                bbox_inches="tight", pad_inches=0.02)
+    return buf.getvalue()
+
+
+def draw_tex(c, tex, cx, cy, max_w, max_h, fontsize):
+    """Рисует формулу по центру (cx, cy); если не влезает — уменьшает."""
+    img = ImageReader(io.BytesIO(render_tex(tex, fontsize)))
+    w_px, h_px = img.getSize()
+    w, h = w_px * 72 / RENDER_DPI, h_px * 72 / RENDER_DPI
+    s = min(1.0, max_w / w, max_h / h)
+    w, h = w * s, h * s
+    c.drawImage(img, cx - w / 2, cy - h / 2, w, h, mask="auto")
+
+
+def fit_font(text, font, size, max_w, min_size=8):
+    while size > min_size and pdfmetrics.stringWidth(text, font, size) > max_w:
+        size -= 0.5
+    return size
+
+
+def draw_maze_page(c, maze, title, answers=False):
+    pw, ph = A4
+    margin, gx, gy = 12 * mm, 17 * mm, 11 * mm
+    top, bottom = ph - 30 * mm, 14 * mm
+    cols, rows = maze.cols, maze.rows
+    cw = (pw - 2 * margin - (cols - 1) * gx) / cols
+    ch = min((top - bottom - (rows - 1) * gy) / rows, cw * 0.75)
+    grid_w, grid_h = cols * cw + (cols - 1) * gx, rows * ch + (rows - 1) * gy
+    x0 = (pw - grid_w) / 2
+    y_top = top - ((top - bottom) - grid_h) / 2
+
+    def cell_xy(i):
+        r, col = divmod(i, cols)
+        return x0 + col * (cw + gx), y_top - r * (ch + gy) - ch
+
+    # ---- шапка ----
+    head = ("ОТВЕТЫ. " if answers else "") + title
+    size = fit_font(head, "DejaVu-Bold", 18, pw - 2 * margin)
+    c.setFillColorRGB(0, 0, 0)
+    c.setFont("DejaVu-Bold", size)
+    c.drawCentredString(pw / 2, ph - 16 * mm, head)
+    c.setFont("DejaVu", 10)
+    if answers:
+        c.drawCentredString(pw / 2, ph - 23 * mm,
+                            "Правильный путь закрашен зелёным, цифры — порядок прохождения клеток")
+    else:
+        c.drawString(margin, ph - 23 * mm,
+                     "Фамилия, имя: ______________________________     Класс: ________     Дата: __________")
+
+    path_set, pedges = set(maze.path), maze.path_edges()
+    cell_green, corr_green = (0.80, 0.94, 0.80), (0.45, 0.80, 0.45)
+    lw, sh, rad = 1.6, 1.8 * mm, 4 * mm
+
+    # ---- тени ----
+    c.setFillColorRGB(0.15, 0.15, 0.15)
+    for i in range(maze.n):
+        x, y = cell_xy(i)
+        c.roundRect(x + sh, y - sh, cw, ch, rad, fill=1, stroke=0)
+
+    # ---- клетки ----
+    c.setLineWidth(lw)
+    c.setStrokeColorRGB(0, 0, 0)
+    for i in range(maze.n):
+        x, y = cell_xy(i)
+        c.setFillColorRGB(*(cell_green if answers and i in path_set else (1, 1, 1)))
+        c.roundRect(x, y, cw, ch, rad, fill=1, stroke=1)
+
+    # ---- коридоры с ответами ----
+    corr_h, corr_w, ov = min(ch * 0.42, 13 * mm), min(cw * 0.42, 22 * mm), lw * 0.75
+    for a, b in maze.edges:
+        xa, ya = cell_xy(a)
+        xb, yb = cell_xy(b)
+        c.setFillColorRGB(*(corr_green if answers and (a, b) in pedges else (1, 1, 1)))
+        if b == a + 1:                                   # горизонтальный
+            x1, x2, cy = xa + cw, xb, ya + ch / 2
+            c.rect(x1 - ov, cy - corr_h / 2, (x2 - x1) + 2 * ov, corr_h, fill=1, stroke=0)
+            c.line(x1, cy + corr_h / 2, x2, cy + corr_h / 2)
+            c.line(x1, cy - corr_h / 2, x2, cy - corr_h / 2)
+            box = ((x1 + x2) / 2, cy, (x2 - x1) - 1.5 * mm, corr_h - 1.5 * mm)
+        else:                                            # вертикальный
+            cx, y1, y2 = xa + cw / 2, yb + ch, ya
+            c.rect(cx - corr_w / 2, y1 - ov, corr_w, (y2 - y1) + 2 * ov, fill=1, stroke=0)
+            c.line(cx - corr_w / 2, y1, cx - corr_w / 2, y2)
+            c.line(cx + corr_w / 2, y1, cx + corr_w / 2, y2)
+            box = (cx, (y1 + y2) / 2, corr_w - 1.5 * mm, (y2 - y1) - 1.5 * mm)
+        draw_tex(c, fmt_tex(maze.label[(a, b)]), *box, fontsize=11)
+
+    # ---- содержимое клеток ----
+    for i in range(maze.n):
+        x, y = cell_xy(i)
+        if i == maze.finish:
+            size = fit_font("ФИНИШ", "DejaVu-Bold", 20, cw - 4 * mm)
+            c.setFillColorRGB(0, 0.45, 0)
+            c.setFont("DejaVu-Bold", size)
+            c.drawCentredString(x + cw / 2, y + ch / 2 - size * 0.35, "ФИНИШ")
+            continue
+        top_pad = 2 * mm
+        if i == maze.start:
+            c.setFillColorRGB(0.8, 0, 0)
+            c.setFont("DejaVu-Bold", 9)
+            c.drawString(x + 3 * mm, y + ch - 4.5 * mm, "СТАРТ")
+            top_pad = 6 * mm
+        if answers and i in path_set:
+            r = 2.6 * mm
+            bx, by = x + cw - r - 1.5 * mm, y + ch - r - 1.5 * mm
+            c.setFillColorRGB(0.1, 0.5, 0.1)
+            c.circle(bx, by, r, fill=1, stroke=0)
+            c.setFillColorRGB(1, 1, 1)
+            c.setFont("DejaVu-Bold", 7.5)
+            c.drawCentredString(bx, by - 2.6, str(maze.path.index(i) + 1))
+            top_pad = max(top_pad, 5.5 * mm)
+        area_h = ch - top_pad - 1.5 * mm
+        draw_tex(c, maze.task[i].tex, x + cw / 2, y + 1.5 * mm + area_h / 2,
+                 cw - 5 * mm, area_h - 1.5 * mm, fontsize=15)
+
+    # ---- подвал ----
+    c.setFillColorRGB(0.35, 0.35, 0.35)
+    c.setFont("DejaVu", 8)
+    c.drawCentredString(pw / 2, 7 * mm, "Реши пример в клетке → найди коридор со своим ответом → "
+                                        "переходи в следующую клетку → дойди до ФИНИША")
+
+
+def make_pdf(topic, grade, cols, rows, variants, title, with_answers):
+    mazes = [create_maze(topic, grade, cols, rows) for _ in range(variants)]
+    names = [title if variants == 1 else f"{title}. Вариант {k + 1}" for k in range(variants)]
+    buf = io.BytesIO()
+    c = pdf_canvas.Canvas(buf, pagesize=A4)
+    c.setTitle(title)
+    for maze, name in zip(mazes, names):              # сначала листы учеников
+        draw_maze_page(c, maze, name, answers=False)
+        c.showPage()
+    if with_answers:                                  # потом листы ответов
+        for maze, name in zip(mazes, names):
+            draw_maze_page(c, maze, name, answers=True)
+            c.showPage()
+    c.save()
+    buf.seek(0)
+    return buf
+
+
+# ======================================================================
+# 7. САЙТ
+# ======================================================================
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "maze-secret-key")
 
 HTML_PAGE = r"""
 <!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Генератор лабиринтов</title>
+<title>Математические лабиринты</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'Segoe UI',sans-serif;background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh;padding:20px}
-.container{max-width:700px;margin:0 auto;background:#fff;border-radius:16px;padding:40px;box-shadow:0 20px 60px rgba(0,0,0,.3)}
-header{text-align:center;margin-bottom:30px}h1{font-size:26px;color:#2c3e50;margin-bottom:6px}.sub{color:#7f8c8d;font-size:14px}
-.fg{display:flex;flex-direction:column;gap:6px;margin-bottom:16px}label{font-weight:600;color:#34495e;font-size:14px}
-input[type=text],select{padding:12px;border:2px solid #e0e0e0;border-radius:8px;font-size:15px;width:100%}input:focus,select:focus{border-color:#667eea;outline:none}
-.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}.hint{font-size:12px;color:#999}.chk{display:flex;align-items:center;gap:8px}
-.btn{padding:16px;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;border:none;border-radius:10px;font-size:18px;font-weight:700;cursor:pointer;width:100%;margin-top:10px}
+.container{max-width:700px;margin:0 auto;background:#fff;border-radius:16px;padding:36px;box-shadow:0 20px 60px rgba(0,0,0,.3)}
+header{text-align:center;margin-bottom:26px}h1{font-size:26px;color:#2c3e50;margin-bottom:6px}.sub{color:#7f8c8d;font-size:14px}
+.fg{display:flex;flex-direction:column;gap:6px;margin-bottom:14px}label{font-weight:600;color:#34495e;font-size:14px}
+input[type=text],select{padding:11px;border:2px solid #e0e0e0;border-radius:8px;font-size:15px;width:100%}
+input:focus,select:focus{border-color:#667eea;outline:none}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:12px}.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
+.hint{font-size:13px;color:#888;margin:-6px 0 14px}
+.chk{display:flex;align-items:center;gap:8px;font-weight:400;margin:6px 0 4px}
+.btn{padding:16px;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;border:none;border-radius:10px;font-size:18px;font-weight:700;cursor:pointer;width:100%;margin-top:12px}
 .btn:hover{transform:translateY(-2px);box-shadow:0 8px 25px rgba(102,126,234,.4)}
 .alert{padding:12px;border-radius:8px;margin-bottom:15px;background:#fdecea;color:#c0392b}
-.tags{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}.tag{padding:6px 14px;background:#f0f0f0;border-radius:20px;font-size:13px;cursor:pointer}.tag:hover{background:#667eea;color:#fff}
-.steps{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
-.step{display:flex;align-items:center;gap:10px;padding:10px;background:#f8f9fa;border-radius:8px;font-size:13px;color:#555}
-.num{width:28px;height:28px;background:#667eea;color:#fff;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;flex-shrink:0}
-footer{margin-top:25px;text-align:center;color:#999;font-size:12px;border-top:1px solid #eee;padding-top:12px}
-@media(max-width:600px){.row3{grid-template-columns:1fr}.steps{grid-template-columns:1fr}}
+footer{margin-top:24px;text-align:center;color:#999;font-size:12px;border-top:1px solid #eee;padding-top:12px}
+@media(max-width:600px){.row2,.row3{grid-template-columns:1fr}}
 </style></head><body><div class="container">
-<header><h1>🧩 Генератор математических лабиринтов</h1><p class="sub">Создайте лабиринт по любой теме — скачайте PDF для печати</p></header>
-{% with m=get_flashed_messages() %}{% if m %}{% for msg in m %}<div class="alert">{{msg}}</div>{% endfor %}{% endif %}{% endwith %}
-<form action="/generate" method="POST">
-<div class="fg"><label>📚 Тема</label><input type="text" name="topic" placeholder="Например: десятичные дроби, углы, уравнения..." required><span class="hint">Любая тема школьной математики</span></div>
-<div class="row3">
-<div class="fg"><label>🎓 Класс</label><select name="grade">{% for i in range(1,12) %}<option value="{{i}}" {{'selected' if i==6}}>{{i}} класс</option>{% endfor %}</select></div>
-<div class="fg"><label>📐 Столбцы</label><select name="cols"><option value="3" selected>3</option><option value="4">4</option></select></div>
-<div class="fg"><label>📐 Строки</label><select name="rows"><option value="4">4</option><option value="5">5</option><option value="6" selected>6</option><option value="7">7</option></select></div>
+<header><h1>🧩 Математические лабиринты</h1>
+<p class="sub">Дроби, 5–8 класс. Выберите параметры — получите PDF для печати и лист ответов.</p></header>
+{% with msgs = get_flashed_messages() %}{% for msg in msgs %}<div class="alert">{{ msg }}</div>{% endfor %}{% endwith %}
+<form action="{{ url_for('generate') }}" method="post">
+<div class="row2">
+  <div class="fg"><label>📚 Тема</label>
+    <select name="topic" id="topic">{% for key, name in topics.items() %}<option value="{{ key }}">{{ name|capitalize }}</option>{% endfor %}</select></div>
+  <div class="fg"><label>🎓 Класс</label>
+    <select name="grade" id="grade">{% for g in grades %}<option value="{{ g }}">{{ g }} класс</option>{% endfor %}</select></div>
 </div>
-<div class="fg"><label>✏️ Заголовок</label><input type="text" name="title" placeholder="Оставьте пустым — сгенерируется автоматически"></div>
-<div class="fg chk"><label><input type="checkbox" name="use_ai" {% if ai %}checked{% else %}disabled{% endif %}> 🤖 Использовать ИИ</label>
-{% if not ai %}<span class="hint">(ИИ не подключен)</span>{% endif %}</div>
+<p class="hint" id="bankinfo"></p>
+<div class="row3">
+  <div class="fg"><label>↔ Столбцы</label><select name="cols"><option value="3" selected>3</option><option value="4">4</option></select></div>
+  <div class="fg"><label>↕ Строки</label><select name="rows">{% for r in [4,5,6,7] %}<option value="{{ r }}" {{ 'selected' if r == 6 }}>{{ r }}</option>{% endfor %}</select></div>
+  <div class="fg"><label>📄 Вариантов</label><select name="variants">{% for v in [1,2,3,4] %}<option value="{{ v }}">{{ v }}</option>{% endfor %}</select></div>
+</div>
+<div class="fg"><label>✏️ Заголовок (необязательно)</label>
+  <input type="text" name="title" maxlength="80" placeholder="Например: Лабиринт по дробям — 5 «Б»"></div>
+<label class="chk"><input type="checkbox" name="answers" checked> Добавить лист ответов (лабиринт с закрашенным путём)</label>
 <button class="btn" type="submit">🎲 Создать лабиринт и скачать PDF</button>
 </form>
-<div style="margin-top:25px;border-top:1px solid #eee;padding-top:15px"><b>💡 Примеры тем:</b><div class="tags">
-<span class="tag" onclick="document.querySelector('[name=topic]').value='десятичные дроби'">Десятичные дроби</span>
-<span class="tag" onclick="document.querySelector('[name=topic]').value='уравнения'">Уравнения</span>
-<span class="tag" onclick="document.querySelector('[name=topic]').value='градусная мера углов'">Углы</span>
-<span class="tag" onclick="document.querySelector('[name=topic]').value='обыкновенные дроби'">Обыкн. дроби</span>
-<span class="tag" onclick="document.querySelector('[name=topic]').value='проценты'">Проценты</span>
-<span class="tag" onclick="document.querySelector('[name=topic]').value='таблица умножения'">Умножение</span>
-</div></div>
-<div style="margin-top:20px;border-top:1px solid #eee;padding-top:15px"><b>📖 Как это работает:</b><div class="steps">
-<div class="step"><div class="num">1</div> Введите тему</div><div class="step"><div class="num">2</div> ИИ создаёт задачи</div>
-<div class="step"><div class="num">3</div> Строится лабиринт</div><div class="step"><div class="num">4</div> Скачайте PDF</div>
-</div></div>
 <footer>Генератор математических лабиринтов © 2026</footer>
-</div></body></html>
+</div>
+<script>
+const counts = {{ counts|tojson }};
+function upd(){
+  const k = document.getElementById('grade').value + '_' + document.getElementById('topic').value;
+  document.getElementById('bankinfo').textContent = 'Задач в банке для этого выбора: ' + (counts[k] || 0);
+}
+document.getElementById('grade').onchange = upd;
+document.getElementById('topic').onchange = upd;
+upd();
+</script>
+</body></html>
 """
 
-@site.route("/")
-def index(): return render_template_string(HTML_PAGE, ai=AI_AVAILABLE)
 
-@site.route("/generate", methods=["POST"])
+@app.route("/")
+def index():
+    counts = {f"{g}_{t}": len(get_pool(g, t)) for g in GRADES for t in TOPICS}
+    return render_template_string(HTML_PAGE, grades=GRADES, topics=TOPICS, counts=counts)
+
+
+@app.route("/generate", methods=["POST"])
 def generate():
-    topic=request.form.get("topic","").strip(); grade=int(request.form.get("grade",6))
-    cols=int(request.form.get("cols",3)); rows=int(request.form.get("rows",6))
-    title=request.form.get("title","").strip(); use_ai=request.form.get("use_ai")=="on"
-    if not topic: flash("Введите тему!"); return redirect(url_for("index"))
-    if not title: title=f"Лабиринт: {topic} ({grade} класс)"
-    total=cols*rows-1
-    if use_ai and AI_AVAILABLE: tasks=generate_tasks_ai(topic,grade,total)
-    else: tasks=generate_tasks_fallback(topic,total)
-    maze=MathMaze(cols,rows); maze.generate_path(); maze.assign_tasks(tasks)
-    fname=f"output/maze_{uuid.uuid4().hex[:8]}.pdf"
-    build_maze_pdf(maze,title,fname)
-    return send_file(fname,as_attachment=True,download_name=f"labirint_{topic[:20]}.pdf",mimetype="application/pdf")
+    try:
+        topic = request.form["topic"]
+        grade = int(request.form["grade"])
+        cols = int(request.form.get("cols", 3))
+        rows = int(request.form.get("rows", 6))
+        variants = int(request.form.get("variants", 1))
+        if topic not in TOPICS or grade not in GRADES or cols not in (3, 4) \
+                or not 4 <= rows <= 7 or not 1 <= variants <= 4:
+            raise ValueError
+    except (KeyError, ValueError):
+        flash("Неверные параметры формы.")
+        return redirect(url_for("index"))
 
-if __name__=="__main__":
-    port=int(os.environ.get("PORT",5000))
-    print(f"🌐 Сайт: http://127.0.0.1:{port}")
-    site.run(host="0.0.0.0", port=port)
+    title = request.form.get("title", "").strip()[:80] or f"Лабиринт: {TOPICS[topic]}, {grade} класс"
+    with_answers = request.form.get("answers") == "on"
+    try:
+        pdf = make_pdf(topic, grade, cols, rows, variants, title, with_answers)
+    except ValueError as e:
+        flash(str(e))
+        return redirect(url_for("index"))
+    return send_file(pdf, as_attachment=True, mimetype="application/pdf",
+                     download_name=f"labirint_{grade}kl_{topic}.pdf")
+
+
+# ======================================================================
+# 8. ПРОВЕРКА БАНКА И ПРОБНЫЙ PDF
+# ======================================================================
+def check_bank():
+    """Печатает ошибки в ответах, нераспознанные записи и сложность банков."""
+    for key, items in TASK_BANK.items():
+        try:
+            g, topic = key.split("_")
+            int(g)
+            assert topic in TOPICS
+        except Exception:
+            print(f"\nНепонятный ключ банка: {key}")
+            continue
+        good, seen, problems = [], set(), []
+        for item in items:
+            expr, given = _split_item(item)
+            if expr in seen:
+                problems.append(f"  [ПОВТОР]      {expr}")
+                continue
+            seen.add(expr)
+            try:
+                node, val = parse_task(expr)
+            except (ValueError, ZeroDivisionError) as e:
+                problems.append(f"  [НЕ РАЗОБРАН] {expr}   ({e})")
+                continue
+            if given is not None:
+                try:
+                    given_val = parse_task(given)[1]
+                except Exception:
+                    given_val = None
+                if given_val != val:
+                    problems.append(f"  [ОШИБКА]      {expr}   в банке: {given}   правильно: {show_value(val, topic)}")
+            if not answer_ok(val, topic):
+                problems.append(f"  [ПРОПУЩЕН]    {expr}   ответ {show_value(val, topic)} не годится для коридора")
+                continue
+            good.append(complexity(node))
+        avg = sum(good) / len(good) if good else 0
+        print(f"\n=== {key}: записей {len(items)}, годных {len(good)}, средняя сложность {avg:.1f}")
+        print("\n".join(problems) if problems else "  проблем нет")
+
+
+if __name__ == "__main__":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+    if len(sys.argv) > 1 and sys.argv[1] == "check":
+        check_bank()
+        sys.exit()
+
+    if len(sys.argv) > 1 and sys.argv[1] == "demo":
+        g = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+        t = sys.argv[3] if len(sys.argv) > 3 else "fraction"
+        out = make_pdf(t, g, 3, 6, 1, f"Лабиринт: {TOPICS[t]}, {g} класс", True)
+        name = f"demo_{g}_{t}.pdf"
+        with open(name, "wb") as f:
+            f.write(out.read())
+        print(f"Готово: {name}")
+        sys.exit()
+
+    port = int(os.environ.get("PORT", 5000))
+    print(f"Сайт: http://127.0.0.1:{port}   (остановить: Ctrl+C)")
+    app.run(host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG") == "1")
